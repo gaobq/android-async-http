@@ -19,6 +19,7 @@
 package com.loopj.android.http;
 
 import android.content.Context;
+import android.os.Looper;
 import android.util.Log;
 
 import org.apache.http.Header;
@@ -38,14 +39,15 @@ import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.client.CookieStore;
 import org.apache.http.client.CredentialsProvider;
 import org.apache.http.client.HttpClient;
-import org.apache.http.client.methods.HttpDelete;
+import org.apache.http.client.RedirectHandler;
 import org.apache.http.client.methods.HttpEntityEnclosingRequestBase;
-import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpHead;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.methods.HttpPut;
 import org.apache.http.client.methods.HttpUriRequest;
+import org.apache.http.client.params.ClientPNames;
 import org.apache.http.client.protocol.ClientContext;
+import org.apache.http.conn.ClientConnectionManager;
 import org.apache.http.conn.params.ConnManagerParams;
 import org.apache.http.conn.params.ConnPerRouteBean;
 import org.apache.http.conn.params.ConnRoutePNames;
@@ -56,7 +58,6 @@ import org.apache.http.conn.ssl.SSLSocketFactory;
 import org.apache.http.entity.HttpEntityWrapper;
 import org.apache.http.impl.auth.BasicScheme;
 import org.apache.http.impl.client.DefaultHttpClient;
-import org.apache.http.impl.client.DefaultRedirectHandler;
 import org.apache.http.impl.conn.tsccm.ThreadSafeClientConnManager;
 import org.apache.http.params.BasicHttpParams;
 import org.apache.http.params.HttpConnectionParams;
@@ -70,7 +71,12 @@ import org.apache.http.protocol.SyncBasicHttpContext;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PushbackInputStream;
+import java.lang.reflect.Field;
 import java.net.URI;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -79,7 +85,6 @@ import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.zip.GZIPInputStream;
 
 
@@ -90,28 +95,44 @@ import java.util.zip.GZIPInputStream;
  * ResponseHandlerInterface} instance. <p>&nbsp;</p> For example: <p>&nbsp;</p>
  * <pre>
  * AsyncHttpClient client = new AsyncHttpClient();
- * client.get("http://www.google.com", new ResponseHandlerInterface() {
+ * client.get("http://www.google.com", new AsyncHttpResponseHandler() {
  *     &#064;Override
- *     public void onSuccess(String response) {
- *         System.out.println(response);
+ *     public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
+ *          System.out.println(response);
+ *     }
+ *     &#064;Override
+ *     public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable
+ * error)
+ * {
+ *          error.printStackTrace(System.out);
  *     }
  * });
  * </pre>
+ *
+ * @see com.loopj.android.http.AsyncHttpResponseHandler
+ * @see com.loopj.android.http.ResponseHandlerInterface
+ * @see com.loopj.android.http.RequestParams
  */
 public class AsyncHttpClient {
 
-    public static final String VERSION = "1.4.5";
+    public static final String LOG_TAG = "AsyncHttpClient";
+
+    public static final String HEADER_CONTENT_TYPE = "Content-Type";
+    public static final String HEADER_CONTENT_RANGE = "Content-Range";
+    public static final String HEADER_CONTENT_ENCODING = "Content-Encoding";
+    public static final String HEADER_CONTENT_DISPOSITION = "Content-Disposition";
+    public static final String HEADER_ACCEPT_ENCODING = "Accept-Encoding";
+    public static final String ENCODING_GZIP = "gzip";
+
     public static final int DEFAULT_MAX_CONNECTIONS = 10;
     public static final int DEFAULT_SOCKET_TIMEOUT = 10 * 1000;
     public static final int DEFAULT_MAX_RETRIES = 5;
     public static final int DEFAULT_RETRY_SLEEP_TIME_MILLIS = 1500;
     public static final int DEFAULT_SOCKET_BUFFER_SIZE = 8192;
-    public static final String HEADER_ACCEPT_ENCODING = "Accept-Encoding";
-    public static final String ENCODING_GZIP = "gzip";
-    public static final String LOG_TAG = "AsyncHttpClient";
 
     private int maxConnections = DEFAULT_MAX_CONNECTIONS;
-    private int timeout = DEFAULT_SOCKET_TIMEOUT;
+    private int connectTimeout = DEFAULT_SOCKET_TIMEOUT;
+    private int responseTimeout = DEFAULT_SOCKET_TIMEOUT;
 
     private final DefaultHttpClient httpClient;
     private final HttpContext httpContext;
@@ -149,7 +170,7 @@ public class AsyncHttpClient {
     /**
      * Creates new AsyncHttpClient using given params
      *
-     * @param fixNoHttpResponseException Whether to fix or not issue, by ommiting SSL verification
+     * @param fixNoHttpResponseException Whether to fix issue or not, by omitting SSL verification
      * @param httpPort                   HTTP port to be used, must be greater than 0
      * @param httpsPort                  HTTPS port to be used, must be greater than 0
      */
@@ -160,7 +181,7 @@ public class AsyncHttpClient {
     /**
      * Returns default instance of SchemeRegistry
      *
-     * @param fixNoHttpResponseException Whether to fix or not issue, by ommiting SSL verification
+     * @param fixNoHttpResponseException Whether to fix issue or not, by omitting SSL verification
      * @param httpPort                   HTTP port to be used, must be greater than 0
      * @param httpsPort                  HTTPS port to be used, must be greater than 0
      */
@@ -182,10 +203,11 @@ public class AsyncHttpClient {
         // Fix to SSL flaw in API < ICS
         // See https://code.google.com/p/android/issues/detail?id=13117
         SSLSocketFactory sslSocketFactory;
-        if (fixNoHttpResponseException)
+        if (fixNoHttpResponseException) {
             sslSocketFactory = MySSLSocketFactory.getFixedSocketFactory();
-        else
+        } else {
             sslSocketFactory = SSLSocketFactory.getSocketFactory();
+        }
 
         SchemeRegistry schemeRegistry = new SchemeRegistry();
         schemeRegistry.register(new Scheme("http", PlainSocketFactory.getSocketFactory(), httpPort));
@@ -203,23 +225,23 @@ public class AsyncHttpClient {
 
         BasicHttpParams httpParams = new BasicHttpParams();
 
-        ConnManagerParams.setTimeout(httpParams, timeout);
+        ConnManagerParams.setTimeout(httpParams, connectTimeout);
         ConnManagerParams.setMaxConnectionsPerRoute(httpParams, new ConnPerRouteBean(maxConnections));
         ConnManagerParams.setMaxTotalConnections(httpParams, DEFAULT_MAX_CONNECTIONS);
 
-        HttpConnectionParams.setSoTimeout(httpParams, timeout);
-        HttpConnectionParams.setConnectionTimeout(httpParams, timeout);
+        HttpConnectionParams.setSoTimeout(httpParams, responseTimeout);
+        HttpConnectionParams.setConnectionTimeout(httpParams, connectTimeout);
         HttpConnectionParams.setTcpNoDelay(httpParams, true);
         HttpConnectionParams.setSocketBufferSize(httpParams, DEFAULT_SOCKET_BUFFER_SIZE);
 
         HttpProtocolParams.setVersion(httpParams, HttpVersion.HTTP_1_1);
-        HttpProtocolParams.setUserAgent(httpParams, String.format("android-async-http/%s (http://loopj.com/android-async-http)", VERSION));
 
-        ThreadSafeClientConnManager cm = new ThreadSafeClientConnManager(httpParams, schemeRegistry);
+        ClientConnectionManager cm = createConnectionManager(schemeRegistry, httpParams);
+        Utils.asserts(cm != null, "Custom implementation of #createConnectionManager(SchemeRegistry, BasicHttpParams) returned null");
 
-        threadPool = Executors.newCachedThreadPool();
-        requestMap = new WeakHashMap();
-        clientHeaderMap = new HashMap();
+        threadPool = getDefaultThreadPool();
+        requestMap = Collections.synchronizedMap(new WeakHashMap<Context, List<RequestHandle>>());
+        clientHeaderMap = new HashMap<String, String>();
 
         httpContext = new SyncBasicHttpContext(new BasicHttpContext());
         httpClient = new DefaultHttpClient(cm, httpParams);
@@ -237,6 +259,9 @@ public class AsyncHttpClient {
                                         header, clientHeaderMap.get(header),
                                         overwritten.getName(), overwritten.getValue())
                         );
+
+                        //remove the overwritten header
+                        request.removeHeader(overwritten);
                     }
                     request.addHeader(header, clientHeaderMap.get(header));
                 }
@@ -329,28 +354,88 @@ public class AsyncHttpClient {
 
     /**
      * Overrides the threadpool implementation used when queuing/pooling requests. By default,
-     * Executors.newFixedThreadPool() is used.
+     * Executors.newCachedThreadPool() is used.
      *
-     * @param threadPool an instance of {@link ThreadPoolExecutor} to use for queuing/pooling
+     * @param threadPool an instance of {@link ExecutorService} to use for queuing/pooling
      *                   requests.
      */
-    public void setThreadPool(ThreadPoolExecutor threadPool) {
+    public void setThreadPool(ExecutorService threadPool) {
         this.threadPool = threadPool;
     }
 
     /**
-     * Simple interface method, to enable or disable redirects. If you set manually RedirectHandler
-     * on underlying HttpClient, effects of this method will be canceled.
+     * Returns the current executor service used. By default, Executors.newCachedThreadPool() is
+     * used.
      *
+     * @return current executor service used
+     */
+    public ExecutorService getThreadPool() {
+        return threadPool;
+    }
+
+    /**
+     * Get the default threading pool to be used for this HTTP client.
+     *
+     * @return The default threading pool to be used
+     */
+    protected ExecutorService getDefaultThreadPool() {
+        return Executors.newCachedThreadPool();
+    }
+
+    /**
+     * Provided so it is easier for developers to provide custom ThreadSafeClientConnManager implementation
+     *
+     * @param schemeRegistry SchemeRegistry, usually provided by {@link #getDefaultSchemeRegistry(boolean, int, int)}
+     * @param httpParams     BasicHttpParams
+     * @return ClientConnectionManager instance
+     */
+    protected ClientConnectionManager createConnectionManager(SchemeRegistry schemeRegistry, BasicHttpParams httpParams) {
+        return new ThreadSafeClientConnManager(httpParams, schemeRegistry);
+    }
+
+    /**
+     * Simple interface method, to enable or disable redirects. If you set manually RedirectHandler
+     * on underlying HttpClient, effects of this method will be canceled. <p>&nbsp;</p> Default
+     * setting is to disallow redirects.
+     *
+     * @param enableRedirects         boolean
+     * @param enableRelativeRedirects boolean
+     * @param enableCircularRedirects boolean
+     */
+    public void setEnableRedirects(final boolean enableRedirects, final boolean enableRelativeRedirects, final boolean enableCircularRedirects) {
+        httpClient.getParams().setBooleanParameter(ClientPNames.REJECT_RELATIVE_REDIRECT, !enableRelativeRedirects);
+        httpClient.getParams().setBooleanParameter(ClientPNames.ALLOW_CIRCULAR_REDIRECTS, enableCircularRedirects);
+        httpClient.setRedirectHandler(new MyRedirectHandler(enableRedirects));
+    }
+
+    /**
+     * Circular redirects are enabled by default
+     *
+     * @param enableRedirects         boolean
+     * @param enableRelativeRedirects boolean
+     * @see #setEnableRedirects(boolean, boolean, boolean)
+     */
+    public void setEnableRedirects(final boolean enableRedirects, final boolean enableRelativeRedirects) {
+        setEnableRedirects(enableRedirects, enableRelativeRedirects, true);
+    }
+
+    /**
      * @param enableRedirects boolean
+     * @see #setEnableRedirects(boolean, boolean, boolean)
      */
     public void setEnableRedirects(final boolean enableRedirects) {
-        httpClient.setRedirectHandler(new DefaultRedirectHandler() {
-            @Override
-            public boolean isRedirectRequested(HttpResponse response, HttpContext context) {
-                return enableRedirects;
-            }
-        });
+        setEnableRedirects(enableRedirects, enableRedirects, enableRedirects);
+    }
+
+    /**
+     * Allows you to set custom RedirectHandler implementation, if the default provided doesn't suit
+     * your needs
+     *
+     * @param customRedirectHandler RedirectHandler instance
+     * @see com.loopj.android.http.MyRedirectHandler
+     */
+    public void setRedirectHandler(final RedirectHandler customRedirectHandler) {
+        httpClient.setRedirectHandler(customRedirectHandler);
     }
 
     /**
@@ -387,27 +472,73 @@ public class AsyncHttpClient {
     }
 
     /**
-     * Returns current socket timeout limit (milliseconds), default is 10000 (10sec)
+     * Returns current socket timeout limit (milliseconds). By default, this is
+     * set to 10 seconds.
      *
      * @return Socket Timeout limit in milliseconds
+     * @deprecated Use either {@link #getConnectTimeout()} or {@link #getResponseTimeout()}
      */
     public int getTimeout() {
-        return timeout;
+        return connectTimeout;
     }
 
     /**
-     * Set the connection and socket timeout. By default, 10 seconds.
+     * Set both the connection and socket timeouts. By default, both are set to
+     * 10 seconds.
      *
-     * @param timeout the connect/socket timeout in milliseconds, at least 1 second
+     * @param value the connect/socket timeout in milliseconds, at least 1 second
+     * @see #setConnectTimeout(int)
+     * @see #setResponseTimeout(int)
      */
-    public void setTimeout(int timeout) {
-        if (timeout < 1000)
-            timeout = DEFAULT_SOCKET_TIMEOUT;
-        this.timeout = timeout;
-        final HttpParams httpParams = this.httpClient.getParams();
-        ConnManagerParams.setTimeout(httpParams, this.timeout);
-        HttpConnectionParams.setSoTimeout(httpParams, this.timeout);
-        HttpConnectionParams.setConnectionTimeout(httpParams, this.timeout);
+    public void setTimeout(int value) {
+        value = value < 1000 ? DEFAULT_SOCKET_TIMEOUT : value;
+        setConnectTimeout(value);
+        setResponseTimeout(value);
+    }
+
+    /**
+     * Returns current connection timeout limit (milliseconds). By default, this
+     * is set to 10 seconds.
+     *
+     * @return Connection timeout limit in milliseconds
+     */
+    public int getConnectTimeout() {
+        return connectTimeout;
+    }
+
+    /**
+     * Set connection timeout limit (milliseconds). By default, this is set to
+     * 10 seconds.
+     *
+     * @param value Connection timeout in milliseconds, minimal value is 1000 (1 second).
+     */
+    public void setConnectTimeout(int value) {
+        connectTimeout = value < 1000 ? DEFAULT_SOCKET_TIMEOUT : value;
+        final HttpParams httpParams = httpClient.getParams();
+        ConnManagerParams.setTimeout(httpParams, connectTimeout);
+        HttpConnectionParams.setConnectionTimeout(httpParams, connectTimeout);
+    }
+
+    /**
+     * Returns current response timeout limit (milliseconds). By default, this
+     * is set to 10 seconds.
+     *
+     * @return Response timeout limit in milliseconds
+     */
+    public int getResponseTimeout() {
+        return responseTimeout;
+    }
+
+    /**
+     * Set response timeout limit (milliseconds). By default, this is set to
+     * 10 seconds.
+     *
+     * @param value Response timeout in milliseconds, minimal value is 1000 (1 second).
+     */
+    public void setResponseTimeout(int value) {
+        responseTimeout = value < 1000 ? DEFAULT_SOCKET_TIMEOUT : value;
+        final HttpParams httpParams = httpClient.getParams();
+        HttpConnectionParams.setSoTimeout(httpParams, responseTimeout);
     }
 
     /**
@@ -460,6 +591,14 @@ public class AsyncHttpClient {
     }
 
     /**
+     * Will, before sending, remove all headers currently present in AsyncHttpClient instance, which
+     * applies on all requests this client makes
+     */
+    public void removeAllHeaders() {
+        clientHeaderMap.clear();
+    }
+
+    /**
      * Sets headers that will be added to all requests this client makes (before sending).
      *
      * @param header the name of the header
@@ -493,12 +632,12 @@ public class AsyncHttpClient {
      * Sets basic authentication for the request. Uses AuthScope.ANY. This is the same as
      * setBasicAuth('username','password',AuthScope.ANY)
      *
-     * @param username  Basic Auth username
-     * @param password  Basic Auth password
-     * @param preemtive sets authorization in preemtive manner
+     * @param username   Basic Auth username
+     * @param password   Basic Auth password
+     * @param preemptive sets authorization in preemptive manner
      */
-    public void setBasicAuth(String username, String password, boolean preemtive) {
-        setBasicAuth(username, password, null, preemtive);
+    public void setBasicAuth(String username, String password, boolean preemptive) {
+        setBasicAuth(username, password, null, preemptive);
     }
 
     /**
@@ -517,35 +656,53 @@ public class AsyncHttpClient {
      * Sets basic authentication for the request. You should pass in your AuthScope for security. It
      * should be like this setBasicAuth("username","password", new AuthScope("host",port,AuthScope.ANY_REALM))
      *
-     * @param username  Basic Auth username
-     * @param password  Basic Auth password
-     * @param scope     an AuthScope object
-     * @param preemtive sets authorization in preemtive manner
+     * @param username   Basic Auth username
+     * @param password   Basic Auth password
+     * @param scope      an AuthScope object
+     * @param preemptive sets authorization in preemptive manner
      */
-    public void setBasicAuth(String username, String password, AuthScope scope, boolean preemtive) {
+    public void setBasicAuth(String username, String password, AuthScope scope, boolean preemptive) {
         UsernamePasswordCredentials credentials = new UsernamePasswordCredentials(username, password);
-        this.httpClient.getCredentialsProvider().setCredentials(scope == null ? AuthScope.ANY : scope, credentials);
-        setAuthenticationPreemptive(preemtive);
+        setCredentials(scope, credentials);
+        setAuthenticationPreemptive(preemptive);
+    }
+
+    public void setCredentials(AuthScope authScope, Credentials credentials) {
+        if (credentials == null) {
+            Log.d(LOG_TAG, "Provided credentials are null, not setting");
+            return;
+        }
+        this.httpClient.getCredentialsProvider().setCredentials(authScope == null ? AuthScope.ANY : authScope, credentials);
     }
 
     /**
-     * Sets HttpRequestInterceptor which handles authorization in preemtive way, as workaround you
+     * Sets HttpRequestInterceptor which handles authorization in preemptive way, as workaround you
      * can use call `AsyncHttpClient.addHeader("Authorization","Basic base64OfUsernameAndPassword==")`
      *
-     * @param isPreemtive whether the authorization is processed in preemtive way
+     * @param isPreemptive whether the authorization is processed in preemptive way
      */
-    public void setAuthenticationPreemptive(boolean isPreemtive) {
-        if (isPreemtive) {
-            httpClient.addRequestInterceptor(new PreemtiveAuthorizationHttpRequestInterceptor(), 0);
+    public void setAuthenticationPreemptive(boolean isPreemptive) {
+        if (isPreemptive) {
+            httpClient.addRequestInterceptor(new PreemptiveAuthorizationHttpRequestInterceptor(), 0);
         } else {
-            httpClient.removeRequestInterceptorByClass(PreemtiveAuthorizationHttpRequestInterceptor.class);
+            httpClient.removeRequestInterceptorByClass(PreemptiveAuthorizationHttpRequestInterceptor.class);
         }
     }
 
     /**
      * Removes previously set basic auth credentials
+     *
+     * @deprecated
      */
+    @Deprecated
     public void clearBasicAuth() {
+        clearCredentialsProvider();
+    }
+
+    /**
+     * Removes previously set auth credentials
+     */
+    public void clearCredentialsProvider() {
         this.httpClient.getCredentialsProvider().clear();
     }
 
@@ -559,13 +716,33 @@ public class AsyncHttpClient {
      * @param mayInterruptIfRunning specifies if active requests should be cancelled along with
      *                              pending requests.
      */
-    public void cancelRequests(Context context, boolean mayInterruptIfRunning) {
-        List<RequestHandle> requestList = requestMap.get(context);
+    public void cancelRequests(final Context context, final boolean mayInterruptIfRunning) {
+        if (context == null) {
+            Log.e(LOG_TAG, "Passed null Context to cancelRequests");
+            return;
+        }
+
+        final List<RequestHandle> requestList = requestMap.get(context);
+        requestMap.remove(context);
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Runnable runnable = new Runnable() {
+                @Override
+                public void run() {
+                    cancelRequests(requestList, mayInterruptIfRunning);
+                }
+            };
+            threadPool.submit(runnable);
+        } else {
+            cancelRequests(requestList, mayInterruptIfRunning);
+        }
+    }
+
+    private void cancelRequests(final List<RequestHandle> requestList, final boolean mayInterruptIfRunning) {
         if (requestList != null) {
             for (RequestHandle requestHandle : requestList) {
                 requestHandle.cancel(mayInterruptIfRunning);
             }
-            requestMap.remove(context);
         }
     }
 
@@ -728,6 +905,23 @@ public class AsyncHttpClient {
                 context);
     }
 
+    /**
+     * Perform a HTTP GET request and track the Android Context which initiated the request.
+     *
+     * @param context         the Android Context which initiated the request.
+     * @param url             the URL to send the request to.
+     * @param entity          a raw {@link org.apache.http.HttpEntity} to send with the request, for
+     *                        example, use this to send string/json/xml payloads to a server by
+     *                        passing a {@link org.apache.http.entity.StringEntity}.
+     * @param contentType     the content type of the payload you are sending, for example
+     *                        application/json if sending a json payload.
+     * @param responseHandler the response ha   ndler instance that should handle the response.
+     * @return RequestHandle of future request process
+     */
+    public RequestHandle get(Context context, String url, HttpEntity entity, String contentType, ResponseHandlerInterface responseHandler) {
+        return sendRequest(httpClient, httpContext, addEntityToRequestBase(new HttpGet(URI.create(url).normalize()), entity), contentType, responseHandler, context);
+    }
+
     // [-] HTTP GET
     // [+] HTTP POST
 
@@ -781,7 +975,7 @@ public class AsyncHttpClient {
      * @return RequestHandle of future request process
      */
     public RequestHandle post(Context context, String url, HttpEntity entity, String contentType, ResponseHandlerInterface responseHandler) {
-        return sendRequest(httpClient, httpContext, addEntityToRequestBase(new HttpPost(URI.create(url).normalize()), entity), contentType, responseHandler, context);
+        return sendRequest(httpClient, httpContext, addEntityToRequestBase(new HttpPost(getURI(url)), entity), contentType, responseHandler, context);
     }
 
     /**
@@ -799,7 +993,7 @@ public class AsyncHttpClient {
      */
     public RequestHandle post(Context context, String url, Header[] headers, RequestParams params, String contentType,
                               ResponseHandlerInterface responseHandler) {
-        HttpEntityEnclosingRequestBase request = new HttpPost(URI.create(url).normalize());
+        HttpEntityEnclosingRequestBase request = new HttpPost(getURI(url));
         if (params != null) request.setEntity(paramsToEntity(params, responseHandler));
         if (headers != null) request.setHeaders(headers);
         return sendRequest(httpClient, httpContext, request, contentType,
@@ -823,7 +1017,7 @@ public class AsyncHttpClient {
      */
     public RequestHandle post(Context context, String url, Header[] headers, HttpEntity entity, String contentType,
                               ResponseHandlerInterface responseHandler) {
-        HttpEntityEnclosingRequestBase request = addEntityToRequestBase(new HttpPost(URI.create(url).normalize()), entity);
+        HttpEntityEnclosingRequestBase request = addEntityToRequestBase(new HttpPost(getURI(url)), entity);
         if (headers != null) request.setHeaders(headers);
         return sendRequest(httpClient, httpContext, request, contentType, responseHandler, context);
     }
@@ -882,7 +1076,7 @@ public class AsyncHttpClient {
      * @return RequestHandle of future request process
      */
     public RequestHandle put(Context context, String url, HttpEntity entity, String contentType, ResponseHandlerInterface responseHandler) {
-        return sendRequest(httpClient, httpContext, addEntityToRequestBase(new HttpPut(URI.create(url).normalize()), entity), contentType, responseHandler, context);
+        return sendRequest(httpClient, httpContext, addEntityToRequestBase(new HttpPut(getURI(url)), entity), contentType, responseHandler, context);
     }
 
     /**
@@ -901,7 +1095,82 @@ public class AsyncHttpClient {
      * @return RequestHandle of future request process
      */
     public RequestHandle put(Context context, String url, Header[] headers, HttpEntity entity, String contentType, ResponseHandlerInterface responseHandler) {
-        HttpEntityEnclosingRequestBase request = addEntityToRequestBase(new HttpPut(URI.create(url).normalize()), entity);
+        HttpEntityEnclosingRequestBase request = addEntityToRequestBase(new HttpPut(getURI(url)), entity);
+        if (headers != null) request.setHeaders(headers);
+        return sendRequest(httpClient, httpContext, request, contentType, responseHandler, context);
+    }
+
+    /**
+     * Perform a HTTP
+     * request, without any parameters.
+     *
+     * @param url             the URL to send the request to.
+     * @param responseHandler the response handler instance that should handle the response.
+     * @return RequestHandle of future request process
+     */
+    public RequestHandle patch(String url, ResponseHandlerInterface responseHandler) {
+        return patch(null, url, null, responseHandler);
+    }
+
+    /**
+     * Perform a HTTP PATCH request with parameters.
+     *
+     * @param url             the URL to send the request to.
+     * @param params          additional PUT parameters or files to send with the request.
+     * @param responseHandler the response handler instance that should handle the response.
+     * @return RequestHandle of future request process
+     */
+    public RequestHandle patch(String url, RequestParams params, ResponseHandlerInterface responseHandler) {
+        return patch(null, url, params, responseHandler);
+    }
+
+    /**
+     * Perform a HTTP PATCH request and track the Android Context which initiated the request.
+     *
+     * @param context         the Android Context which initiated the request.
+     * @param url             the URL to send the request to.
+     * @param params          additional PUT parameters or files to send with the request.
+     * @param responseHandler the response handler instance that should handle the response.
+     * @return RequestHandle of future request process
+     */
+    public RequestHandle patch(Context context, String url, RequestParams params, ResponseHandlerInterface responseHandler) {
+        return patch(context, url, paramsToEntity(params, responseHandler), null, responseHandler);
+    }
+
+    /**
+     * Perform a HTTP PATCH request and track the Android Context which initiated the request.
+     *
+     * @param context         the Android Context which initiated the request.
+     * @param url             the URL to send the request to.
+     * @param responseHandler the response handler instance that should handle the response.
+     * @param entity          a raw {@link HttpEntity} to send with the request, for example, use
+     *                        this to send string/json/xml payloads to a server by passing a {@link
+     *                        org.apache.http.entity.StringEntity}
+     * @param contentType     the content type of the payload you are sending, for example
+     *                        "application/json" if sending a json payload.
+     * @return RequestHandle of future request process
+     */
+    public RequestHandle patch(Context context, String url, HttpEntity entity, String contentType, ResponseHandlerInterface responseHandler) {
+        return sendRequest(httpClient, httpContext, addEntityToRequestBase(new HttpPatch(getURI(url)), entity), contentType, responseHandler, context);
+    }
+
+    /**
+     * Perform a HTTP PATCH request and track the Android Context which initiated the request. And set
+     * one-time headers for the request
+     *
+     * @param context         the Android Context which initiated the request.
+     * @param url             the URL to send the request to.
+     * @param headers         set one-time headers for this request
+     * @param entity          a raw {@link HttpEntity} to send with the request, for example, use
+     *                        this to send string/json/xml payloads to a server by passing a {@link
+     *                        org.apache.http.entity.StringEntity}.
+     * @param contentType     the content type of the payload you are sending, for example
+     *                        application/json if sending a json payload.
+     * @param responseHandler the response handler instance that should handle the response.
+     * @return RequestHandle of future request process
+     */
+    public RequestHandle patch(Context context, String url, Header[] headers, HttpEntity entity, String contentType, ResponseHandlerInterface responseHandler) {
+        HttpEntityEnclosingRequestBase request = addEntityToRequestBase(new HttpPatch(getURI(url)), entity);
         if (headers != null) request.setHeaders(headers);
         return sendRequest(httpClient, httpContext, request, contentType, responseHandler, context);
     }
@@ -929,7 +1198,7 @@ public class AsyncHttpClient {
      * @return RequestHandle of future request process
      */
     public RequestHandle delete(Context context, String url, ResponseHandlerInterface responseHandler) {
-        final HttpDelete delete = new HttpDelete(URI.create(url).normalize());
+        final HttpDelete delete = new HttpDelete(getURI(url));
         return sendRequest(httpClient, httpContext, delete, null, responseHandler, context);
     }
 
@@ -943,9 +1212,21 @@ public class AsyncHttpClient {
      * @return RequestHandle of future request process
      */
     public RequestHandle delete(Context context, String url, Header[] headers, ResponseHandlerInterface responseHandler) {
-        final HttpDelete delete = new HttpDelete(URI.create(url).normalize());
+        final HttpDelete delete = new HttpDelete(getURI(url));
         if (headers != null) delete.setHeaders(headers);
         return sendRequest(httpClient, httpContext, delete, null, responseHandler, context);
+    }
+
+    /**
+     * Perform a HTTP DELETE request.
+     *
+     * @param url             the URL to send the request to.
+     * @param params          additional DELETE parameters or files to send with the request.
+     * @param responseHandler the response handler instance that should handle the response.
+     */
+    public void delete(String url, RequestParams params, AsyncHttpResponseHandler responseHandler) {
+        final HttpDelete delete = new HttpDelete(getUrlWithQueryString(isUrlEncodingEnabled, url, params));
+        sendRequest(httpClient, httpContext, delete, null, responseHandler, null);
     }
 
     /**
@@ -964,7 +1245,40 @@ public class AsyncHttpClient {
         return sendRequest(httpClient, httpContext, httpDelete, null, responseHandler, context);
     }
 
+    /**
+     * Perform a HTTP DELETE request and track the Android Context which initiated the request.
+     *
+     * @param context         the Android Context which initiated the request.
+     * @param url             the URL to send the request to.
+     * @param entity          a raw {@link org.apache.http.HttpEntity} to send with the request, for
+     *                        example, use this to send string/json/xml payloads to a server by
+     *                        passing a {@link org.apache.http.entity.StringEntity}.
+     * @param contentType     the content type of the payload you are sending, for example
+     *                        application/json if sending a json payload.
+     * @param responseHandler the response ha   ndler instance that should handle the response.
+     * @return RequestHandle of future request process
+     */
+    public RequestHandle delete(Context context, String url, HttpEntity entity, String contentType, ResponseHandlerInterface responseHandler) {
+        return sendRequest(httpClient, httpContext, addEntityToRequestBase(new HttpDelete(URI.create(url).normalize()), entity), contentType, responseHandler, context);
+    }
+
     // [-] HTTP DELETE
+
+    /**
+     * Instantiate a new asynchronous HTTP request for the passed parameters.
+     *
+     * @param client          HttpClient to be used for request, can differ in single requests
+     * @param contentType     MIME body type, for POST and PUT requests, may be null
+     * @param context         Context of Android application, to hold the reference of request
+     * @param httpContext     HttpContext in which the request will be executed
+     * @param responseHandler ResponseHandler or its subclass to put the response into
+     * @param uriRequest      instance of HttpUriRequest, which means it must be of HttpDelete,
+     *                        HttpPost, HttpGet, HttpPut, etc.
+     * @return AsyncHttpRequest ready to be dispatched
+     */
+    protected AsyncHttpRequest newAsyncHttpRequest(DefaultHttpClient client, HttpContext httpContext, HttpUriRequest uriRequest, String contentType, ResponseHandlerInterface responseHandler, Context context) {
+        return new AsyncHttpRequest(client, httpContext, uriRequest, responseHandler);
+    }
 
     /**
      * Puts a new request in queue as a new thread in pool to be executed
@@ -987,31 +1301,35 @@ public class AsyncHttpClient {
             throw new IllegalArgumentException("ResponseHandler must not be null");
         }
 
-        if (responseHandler.getUseSynchronousMode()) {
+        if (responseHandler.getUseSynchronousMode() && !responseHandler.getUsePoolThread()) {
             throw new IllegalArgumentException("Synchronous ResponseHandler used in AsyncHttpClient. You should create your response handler in a looper thread or use SyncHttpClient instead.");
         }
-
+        
         if (contentType != null) {
-            uriRequest.setHeader("Content-Type", contentType);
+            if (uriRequest instanceof HttpEntityEnclosingRequestBase && ((HttpEntityEnclosingRequestBase) uriRequest).getEntity() != null && uriRequest.containsHeader(HEADER_CONTENT_TYPE)) {
+                Log.w(LOG_TAG, "Passed contentType will be ignored because HttpEntity sets content type");
+            } else {
+                uriRequest.setHeader(HEADER_CONTENT_TYPE, contentType);
+            }
         }
 
         responseHandler.setRequestHeaders(uriRequest.getAllHeaders());
         responseHandler.setRequestURI(uriRequest.getURI());
 
-        AsyncHttpRequest request = new AsyncHttpRequest(client, httpContext, uriRequest, responseHandler);
+        AsyncHttpRequest request = newAsyncHttpRequest(client, httpContext, uriRequest, contentType, responseHandler, context);
         threadPool.submit(request);
         RequestHandle requestHandle = new RequestHandle(request);
 
         if (context != null) {
+            List<RequestHandle> requestList;
             // Add request to request map
-            List<RequestHandle> requestList = requestMap.get(context);
-            if (requestList == null) {
-                requestList = new LinkedList();
-                requestMap.put(context, requestList);
+            synchronized (requestMap) {
+                requestList = requestMap.get(context);
+                if (requestList == null) {
+                    requestList = Collections.synchronizedList(new LinkedList<RequestHandle>());
+                    requestMap.put(context, requestList);
+                }
             }
-
-            if (responseHandler instanceof RangeFileAsyncHttpResponseHandler)
-                ((RangeFileAsyncHttpResponseHandler) responseHandler).updateRequestHeaders(uriRequest);
 
             requestList.add(requestHandle);
 
@@ -1024,6 +1342,16 @@ public class AsyncHttpClient {
         }
 
         return requestHandle;
+    }
+
+    /**
+     * Returns a {@link URI} instance for the specified, absolute URL string.
+     *
+     * @param url absolute URL string, containing scheme, host and path
+     * @return URI instance for the URL string
+     */
+    protected URI getURI(String url) {
+        return URI.create(url).normalize();
     }
 
     /**
@@ -1045,8 +1373,20 @@ public class AsyncHttpClient {
      * @return encoded url if requested with params appended if any available
      */
     public static String getUrlWithQueryString(boolean shouldEncodeUrl, String url, RequestParams params) {
-        if (shouldEncodeUrl)
-            url = url.replace(" ", "%20");
+        if (url == null)
+            return null;
+
+        if (shouldEncodeUrl) {
+            try {
+                String decodedURL = URLDecoder.decode(url, "UTF-8");
+                URL _url = new URL(decodedURL);
+                URI _uri = new URI(_url.getProtocol(), _url.getUserInfo(), _url.getHost(), _url.getPort(), _url.getPath(), _url.getQuery(), _url.getRef());
+                url = _uri.toASCIIString();
+            } catch (Exception ex) {
+                // Should not really happen, added just for sake of validity
+                Log.e(LOG_TAG, "getUrlWithQueryString encoding URL", ex);
+            }
+        }
 
         if (params != null) {
             // Construct the query string and trim it, in case it
@@ -1062,6 +1402,24 @@ public class AsyncHttpClient {
         }
 
         return url;
+    }
+
+    /**
+     * Checks the InputStream if it contains  GZIP compressed data
+     *
+     * @param inputStream InputStream to be checked
+     * @return true or false if the stream contains GZIP compressed data
+     * @throws java.io.IOException if read from inputStream fails
+     */
+    public static boolean isInputStreamGZIPCompressed(final PushbackInputStream inputStream) throws IOException {
+        if (inputStream == null)
+            return false;
+
+        byte[] signature = new byte[2];
+        int readStatus = inputStream.read(signature);
+        inputStream.unread(signature);
+        int streamHeader = ((int) signature[0] & 0xff) | ((signature[1] << 8) & 0xff00);
+        return readStatus == 2 && GZIPInputStream.GZIP_MAGIC == streamHeader;
     }
 
     /**
@@ -1108,11 +1466,12 @@ public class AsyncHttpClient {
             if (params != null) {
                 entity = params.getEntity(responseHandler);
             }
-        } catch (Throwable t) {
-            if (responseHandler != null)
-                responseHandler.sendFailureMessage(0, null, null, t);
-            else
-                t.printStackTrace();
+        } catch (IOException e) {
+            if (responseHandler != null) {
+                responseHandler.sendFailureMessage(0, null, null, e);
+            } else {
+                e.printStackTrace();
+            }
         }
 
         return entity;
@@ -1138,21 +1497,71 @@ public class AsyncHttpClient {
     }
 
     /**
+     * This horrible hack is required on Android, due to implementation of BasicManagedEntity, which
+     * doesn't chain call consumeContent on underlying wrapped HttpEntity
+     *
+     * @param entity HttpEntity, may be null
+     */
+    public static void endEntityViaReflection(HttpEntity entity) {
+        if (entity instanceof HttpEntityWrapper) {
+            try {
+                Field f = null;
+                Field[] fields = HttpEntityWrapper.class.getDeclaredFields();
+                for (Field ff : fields) {
+                    if (ff.getName().equals("wrappedEntity")) {
+                        f = ff;
+                        break;
+                    }
+                }
+                if (f != null) {
+                    f.setAccessible(true);
+                    HttpEntity wrapped = (HttpEntity) f.get(entity);
+                    if (wrapped != null) {
+                        wrapped.consumeContent();
+                    }
+                }
+            } catch (Throwable t) {
+                Log.e(LOG_TAG, "wrappedEntity consume", t);
+            }
+        }
+    }
+
+    /**
      * Enclosing entity to hold stream of gzip decoded data for accessing HttpEntity contents
      */
     private static class InflatingEntity extends HttpEntityWrapper {
+
         public InflatingEntity(HttpEntity wrapped) {
             super(wrapped);
         }
 
+        InputStream wrappedStream;
+        PushbackInputStream pushbackStream;
+        GZIPInputStream gzippedStream;
+
         @Override
         public InputStream getContent() throws IOException {
-            return new GZIPInputStream(wrappedEntity.getContent());
+            wrappedStream = wrappedEntity.getContent();
+            pushbackStream = new PushbackInputStream(wrappedStream, 2);
+            if (isInputStreamGZIPCompressed(pushbackStream)) {
+                gzippedStream = new GZIPInputStream(pushbackStream);
+                return gzippedStream;
+            } else {
+                return pushbackStream;
+            }
         }
 
         @Override
         public long getContentLength() {
-            return -1;
+            return wrappedEntity == null ? 0 : wrappedEntity.getContentLength();
+        }
+
+        @Override
+        public void consumeContent() throws IOException {
+            AsyncHttpClient.silentCloseInputStream(wrappedStream);
+            AsyncHttpClient.silentCloseInputStream(pushbackStream);
+            AsyncHttpClient.silentCloseInputStream(gzippedStream);
+            super.consumeContent();
         }
     }
 }

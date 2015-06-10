@@ -1,5 +1,3 @@
-package com.loopj.android.http;
-
 /*
     Android Asynchronous Http Client
     Copyright (c) 2011 James Smith <james@loopj.com>
@@ -18,6 +16,8 @@ package com.loopj.android.http;
     limitations under the License.
 */
 
+package com.loopj.android.http;
+
 import android.os.Message;
 import android.util.Log;
 
@@ -27,10 +27,11 @@ import org.apache.http.util.ByteArrayBuffer;
 import java.io.IOException;
 import java.io.InputStream;
 
+@SuppressWarnings("ALL")
 public abstract class DataAsyncHttpResponseHandler extends AsyncHttpResponseHandler {
     private static final String LOG_TAG = "DataAsyncHttpResponseHandler";
 
-    protected static final int PROGRESS_DATA_MESSAGE = 6;
+    protected static final int PROGRESS_DATA_MESSAGE = 7;
 
     /**
      * Creates a new AsyncHttpResponseHandler
@@ -45,6 +46,7 @@ public abstract class DataAsyncHttpResponseHandler extends AsyncHttpResponseHand
      * @param responseBody response body received so far
      */
     public void onProgressData(byte[] responseBody) {
+        Log.d(LOG_TAG, "onProgressData(byte[]) was not overriden, but callback was received");
     }
 
 
@@ -99,11 +101,12 @@ public abstract class DataAsyncHttpResponseHandler extends AsyncHttpResponseHand
                     ByteArrayBuffer buffer = new ByteArrayBuffer((int) contentLength);
                     try {
                         byte[] tmp = new byte[BUFFER_SIZE];
-                        int l;
+                        int l, count = 0;
                         // do not send messages if request has been cancelled
                         while ((l = instream.read(tmp)) != -1 && !Thread.currentThread().isInterrupted()) {
                             buffer.append(tmp, 0, l);
                             sendProgressDataMessage(copyOfRange(tmp, 0, l));
+                            sendProgressMessage(count, contentLength);
                         }
                     } finally {
                         AsyncHttpClient.silentCloseInputStream(instream);

@@ -29,6 +29,7 @@ import org.apache.http.protocol.HttpContext;
 import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.UnknownHostException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Internal class, representing the HttpRequest, done in asynchronous manner
@@ -39,15 +40,46 @@ public class AsyncHttpRequest implements Runnable {
     private final HttpUriRequest request;
     private final ResponseHandlerInterface responseHandler;
     private int executionCount;
-    private boolean isCancelled = false;
-    private boolean cancelIsNotified = false;
-    private boolean isFinished = false;
+    private final AtomicBoolean isCancelled = new AtomicBoolean();
+    private boolean cancelIsNotified;
+    private volatile boolean isFinished;
+    private boolean isRequestPreProcessed;
 
     public AsyncHttpRequest(AbstractHttpClient client, HttpContext context, HttpUriRequest request, ResponseHandlerInterface responseHandler) {
-        this.client = client;
-        this.context = context;
-        this.request = request;
-        this.responseHandler = responseHandler;
+        this.client = Utils.notNull(client, "client");
+        this.context = Utils.notNull(context, "context");
+        this.request = Utils.notNull(request, "request");
+        this.responseHandler = Utils.notNull(responseHandler, "responseHandler");
+    }
+
+    /**
+     * This method is called once by the system when the request is about to be
+     * processed by the system. The library makes sure that a single request
+     * is pre-processed only once.
+     *
+     * Please note: pre-processing does NOT run on the main thread, and thus
+     * any UI activities that you must perform should be properly dispatched to
+     * the app's UI thread.
+     *
+     * @param request The request to pre-process
+     */
+    public void onPreProcessRequest(AsyncHttpRequest request) {
+        // default action is to do nothing...
+    }
+
+    /**
+     * This method is called once by the system when the request has been fully
+     * sent, handled and finished. The library makes sure that a single request
+     * is post-processed only once.
+     *
+     * Please note: post-processing does NOT run on the main thread, and thus
+     * any UI activities that you must perform should be properly dispatched to
+     * the app's UI thread.
+     *
+     * @param request The request to post-process
+     */
+    public void onPostProcessRequest(AsyncHttpRequest request) {
+        // default action is to do nothing...
     }
 
     @Override
@@ -56,9 +88,17 @@ public class AsyncHttpRequest implements Runnable {
             return;
         }
 
-        if (responseHandler != null) {
-            responseHandler.sendStartMessage();
+        // Carry out pre-processing for this request only once.
+        if (!isRequestPreProcessed) {
+            isRequestPreProcessed = true;
+            onPreProcessRequest(this);
         }
+
+        if (isCancelled()) {
+            return;
+        }
+
+        responseHandler.sendStartMessage();
 
         if (isCancelled()) {
             return;
@@ -67,10 +107,10 @@ public class AsyncHttpRequest implements Runnable {
         try {
             makeRequestWithRetries();
         } catch (IOException e) {
-            if (!isCancelled() && responseHandler != null) {
+            if (!isCancelled()) {
                 responseHandler.sendFailureMessage(0, null, null, e);
             } else {
-                Log.e("AsyncHttpRequest", "makeRequestWithRetries returned error, but handler is null", e);
+                Log.e("AsyncHttpRequest", "makeRequestWithRetries returned error", e);
             }
         }
 
@@ -78,9 +118,14 @@ public class AsyncHttpRequest implements Runnable {
             return;
         }
 
-        if (responseHandler != null) {
-            responseHandler.sendFinishMessage();
+        responseHandler.sendFinishMessage();
+
+        if (isCancelled()) {
+            return;
         }
+
+        // Carry out post-processing for this request.
+        onPostProcessRequest(this);
 
         isFinished = true;
     }
@@ -89,17 +134,39 @@ public class AsyncHttpRequest implements Runnable {
         if (isCancelled()) {
             return;
         }
+
         // Fixes #115
         if (request.getURI().getScheme() == null) {
             // subclass of IOException so processed in the caller
             throw new MalformedURLException("No valid URI scheme was provided");
         }
 
+        if (responseHandler instanceof RangeFileAsyncHttpResponseHandler) {
+            ((RangeFileAsyncHttpResponseHandler) responseHandler).updateRequestHeaders(request);
+        }
+
         HttpResponse response = client.execute(request, context);
 
-        if (!isCancelled() && responseHandler != null) {
-            responseHandler.sendResponseMessage(response);
+        if (isCancelled()) {
+            return;
         }
+
+        // Carry out pre-processing for this response.
+        responseHandler.onPreProcessResponse(responseHandler, response);
+
+        if (isCancelled()) {
+            return;
+        }
+
+        // The response is ready, handle it.
+        responseHandler.sendResponseMessage(response);
+
+        if (isCancelled()) {
+            return;
+        }
+
+        // Carry out post-processing for this response.
+        responseHandler.onPostProcessResponse(responseHandler, response);
     }
 
     private void makeRequestWithRetries() throws IOException {
@@ -116,7 +183,7 @@ public class AsyncHttpRequest implements Runnable {
                     // while the WI-FI is initialising. The retry logic will be invoked here, if this is NOT the first retry
                     // (to assist in genuine cases of unknown host) which seems better than outright failure
                     cause = new IOException("UnknownHostException exception: " + e.getMessage());
-                    retry = (executionCount > 0) && retryHandler.retryRequest(cause, ++executionCount, context);
+                    retry = (executionCount > 0) && retryHandler.retryRequest(e, ++executionCount, context);
                 } catch (NullPointerException e) {
                     // there's a bug in HttpClient 4.0.x that on some occasions causes
                     // DefaultRequestExecutor to throw an NPE, see
@@ -131,7 +198,7 @@ public class AsyncHttpRequest implements Runnable {
                     cause = e;
                     retry = retryHandler.retryRequest(cause, ++executionCount, context);
                 }
-                if (retry && (responseHandler != null)) {
+                if (retry) {
                     responseHandler.sendRetryMessage(executionCount);
                 }
             }
@@ -146,17 +213,17 @@ public class AsyncHttpRequest implements Runnable {
     }
 
     public boolean isCancelled() {
-        if (isCancelled) {
+        boolean cancelled = isCancelled.get();
+        if (cancelled) {
             sendCancelNotification();
         }
-        return isCancelled;
+        return cancelled;
     }
 
     private synchronized void sendCancelNotification() {
-        if (!isFinished && isCancelled && !cancelIsNotified) {
+        if (!isFinished && isCancelled.get() && !cancelIsNotified) {
             cancelIsNotified = true;
-            if (responseHandler != null)
-                responseHandler.sendCancelMessage();
+            responseHandler.sendCancelMessage();
         }
     }
 
@@ -165,10 +232,8 @@ public class AsyncHttpRequest implements Runnable {
     }
 
     public boolean cancel(boolean mayInterruptIfRunning) {
-        isCancelled = true;
-        if (mayInterruptIfRunning && request != null && !request.isAborted()) {
-            request.abort();
-        }
+        isCancelled.set(true);
+        request.abort();
         return isCancelled();
     }
 }

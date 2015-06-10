@@ -1,12 +1,4 @@
-buildscript {
-    repositories {
-        mavenCentral()
-    }
-    dependencies {
-        classpath 'com.android.tools.build:gradle:0.+'
-    }
-}
-apply plugin: 'android'
+apply plugin: 'com.android.application'
 
 repositories {
     mavenCentral()
@@ -16,12 +8,12 @@ repositories {
 }
 
 android {
-    compileSdkVersion 19
-    buildToolsVersion '19.0.3'
+    compileSdkVersion 22
+    buildToolsVersion '22.0.1'
 
     defaultConfig {
         minSdkVersion 3
-        targetSdkVersion 19
+        targetSdkVersion 22
     }
 
     compileOptions {
@@ -30,7 +22,11 @@ android {
     }
 
     lintOptions {
-        abortOnError false
+        xmlReport false
+        warningsAsErrors true
+        quiet false
+        showAll true
+        disable 'OldTargetApi', 'LongLogTag'
     }
 
     packagingOptions {
@@ -41,6 +37,6 @@ android {
 }
 
 dependencies {
-    compile 'com.fasterxml.jackson.core:jackson-databind:2.2.3'
+    compile 'com.fasterxml.jackson.core:jackson-databind:2.5.3'
     compile project(':library')
 }

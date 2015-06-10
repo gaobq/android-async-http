@@ -36,22 +36,47 @@ import org.json.JSONTokener;
  * Additionally, you can override the other event methods from the parent class.
  */
 public class JsonHttpResponseHandler extends TextHttpResponseHandler {
+
     private static final String LOG_TAG = "JsonHttpResponseHandler";
 
+
+    private boolean useRFC5179CompatibilityMode = true;
+
     /**
-     * Creates new JsonHttpResponseHandler, with Json String encoding UTF-8
+     * Creates new JsonHttpResponseHandler, with JSON String encoding UTF-8
      */
     public JsonHttpResponseHandler() {
         super(DEFAULT_CHARSET);
     }
 
     /**
-     * Creates new JsonHttpRespnseHandler with given Json String encoding
+     * Creates new JsonHttpResponseHandler with given JSON String encoding
      *
      * @param encoding String encoding to be used when parsing JSON
      */
     public JsonHttpResponseHandler(String encoding) {
         super(encoding);
+    }
+
+    /**
+     * Creates new JsonHttpResponseHandler with JSON String encoding UTF-8 and given RFC5179CompatibilityMode
+     *
+     * @param useRFC5179CompatibilityMode Boolean mode to use RFC5179 or latest
+     */
+    public JsonHttpResponseHandler(boolean useRFC5179CompatibilityMode) {
+        super(DEFAULT_CHARSET);
+        this.useRFC5179CompatibilityMode = useRFC5179CompatibilityMode;
+    }
+
+    /**
+     * Creates new JsonHttpResponseHandler with given JSON String encoding and RFC5179CompatibilityMode
+     *
+     * @param encoding                    String encoding to be used when parsing JSON
+     * @param useRFC5179CompatibilityMode Boolean mode to use RFC5179 or latest
+     */
+    public JsonHttpResponseHandler(String encoding, boolean useRFC5179CompatibilityMode) {
+        super(encoding);
+        this.useRFC5179CompatibilityMode = useRFC5179CompatibilityMode;
     }
 
     /**
@@ -62,7 +87,7 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
      * @param response   parsed response if any
      */
     public void onSuccess(int statusCode, Header[] headers, JSONObject response) {
-
+        Log.w(LOG_TAG, "onSuccess(int, Header[], JSONObject) was not overriden, but callback was received");
     }
 
     /**
@@ -73,7 +98,7 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
      * @param response   parsed response if any
      */
     public void onSuccess(int statusCode, Header[] headers, JSONArray response) {
-
+        Log.w(LOG_TAG, "onSuccess(int, Header[], JSONArray) was not overriden, but callback was received");
     }
 
     /**
@@ -85,7 +110,7 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
      * @param errorResponse parsed response if any
      */
     public void onFailure(int statusCode, Header[] headers, Throwable throwable, JSONObject errorResponse) {
-
+        Log.w(LOG_TAG, "onFailure(int, Header[], Throwable, JSONObject) was not overriden, but callback was received", throwable);
     }
 
     /**
@@ -97,23 +122,23 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
      * @param errorResponse parsed response if any
      */
     public void onFailure(int statusCode, Header[] headers, Throwable throwable, JSONArray errorResponse) {
-
+        Log.w(LOG_TAG, "onFailure(int, Header[], Throwable, JSONArray) was not overriden, but callback was received", throwable);
     }
 
     @Override
     public void onFailure(int statusCode, Header[] headers, String responseString, Throwable throwable) {
-
+        Log.w(LOG_TAG, "onFailure(int, Header[], String, Throwable) was not overriden, but callback was received", throwable);
     }
 
     @Override
     public void onSuccess(int statusCode, Header[] headers, String responseString) {
-
+        Log.w(LOG_TAG, "onSuccess(int, Header[], String) was not overriden, but callback was received");
     }
 
     @Override
     public final void onSuccess(final int statusCode, final Header[] headers, final byte[] responseBytes) {
         if (statusCode != HttpStatus.SC_NO_CONTENT) {
-	    Runnable parser = new Runnable() {
+            Runnable parser = new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -121,16 +146,23 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
                         postRunnable(new Runnable() {
                             @Override
                             public void run() {
-                                if (jsonResponse instanceof JSONObject) {
+                                // In RFC5179 a null value is not a valid JSON
+                                if (!useRFC5179CompatibilityMode && jsonResponse == null) {
+                                    onSuccess(statusCode, headers, (String) jsonResponse);
+                                } else if (jsonResponse instanceof JSONObject) {
                                     onSuccess(statusCode, headers, (JSONObject) jsonResponse);
                                 } else if (jsonResponse instanceof JSONArray) {
                                     onSuccess(statusCode, headers, (JSONArray) jsonResponse);
                                 } else if (jsonResponse instanceof String) {
-                                    onFailure(statusCode, headers, (String) jsonResponse, new JSONException("Response cannot be parsed as JSON data"));
+                                    // In RFC5179 a simple string value is not a valid JSON
+                                    if (useRFC5179CompatibilityMode) {
+                                        onFailure(statusCode, headers, (String) jsonResponse, new JSONException("Response cannot be parsed as JSON data"));
+                                    } else {
+                                        onSuccess(statusCode, headers, (String) jsonResponse);
+                                    }
                                 } else {
                                     onFailure(statusCode, headers, new JSONException("Unexpected response type " + jsonResponse.getClass().getName()), (JSONObject) null);
                                 }
-
                             }
                         });
                     } catch (final JSONException ex) {
@@ -142,11 +174,13 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
                         });
                     }
                 }
-	    };
-	    if (!getUseSynchronousMode())
-		new Thread(parser).start();
-	    else // In synchronous mode everything should be run on one thread
-		parser.run();
+            };
+            if (!getUseSynchronousMode() && !getUsePoolThread()) {
+                new Thread(parser).start();
+            } else {
+                // In synchronous mode everything should be run on one thread
+                parser.run();
+            }
         } else {
             onSuccess(statusCode, headers, new JSONObject());
         }
@@ -155,7 +189,7 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
     @Override
     public final void onFailure(final int statusCode, final Header[] headers, final byte[] responseBytes, final Throwable throwable) {
         if (responseBytes != null) {
-	    Runnable parser = new Runnable() {
+            Runnable parser = new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -163,7 +197,10 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
                         postRunnable(new Runnable() {
                             @Override
                             public void run() {
-                                if (jsonResponse instanceof JSONObject) {
+                                // In RFC5179 a null value is not a valid JSON
+                                if (!useRFC5179CompatibilityMode && jsonResponse == null) {
+                                    onFailure(statusCode, headers, (String) jsonResponse, throwable);
+                                } else if (jsonResponse instanceof JSONObject) {
                                     onFailure(statusCode, headers, throwable, (JSONObject) jsonResponse);
                                 } else if (jsonResponse instanceof JSONArray) {
                                     onFailure(statusCode, headers, throwable, (JSONArray) jsonResponse);
@@ -185,11 +222,13 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
 
                     }
                 }
-	    };
-	    if (!getUseSynchronousMode())
-		new Thread(parser).start();
-	    else // In synchronous mode everything should be run on one thread
-		parser.run();
+            };
+            if (!getUseSynchronousMode() && !getUsePoolThread()) {
+                new Thread(parser).start();
+            } else {
+                // In synchronous mode everything should be run on one thread
+                parser.run();
+            }
         } else {
             Log.v(LOG_TAG, "response body is null, calling onFailure(Throwable, JSONObject)");
             onFailure(statusCode, headers, throwable, (JSONObject) null);
@@ -208,12 +247,26 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
         if (null == responseBody)
             return null;
         Object result = null;
-        //trim the string to prevent start with blank, and test if the string is valid JSON, because the parser don't do this :(. If Json is not valid this will return null
+        //trim the string to prevent start with blank, and test if the string is valid JSON, because the parser don't do this :(. If JSON is not valid this will return null
         String jsonString = getResponseString(responseBody, getCharset());
         if (jsonString != null) {
             jsonString = jsonString.trim();
-            if (jsonString.startsWith("{") || jsonString.startsWith("[")) {
-                result = new JSONTokener(jsonString).nextValue();
+            if (useRFC5179CompatibilityMode) {
+                if (jsonString.startsWith("{") || jsonString.startsWith("[")) {
+                    result = new JSONTokener(jsonString).nextValue();
+                }
+            } else {
+                // Check if the string is an JSONObject style {} or JSONArray style []
+                // If not we consider this as a string
+                if ((jsonString.startsWith("{") && jsonString.endsWith("}"))
+                        || jsonString.startsWith("[") && jsonString.endsWith("]")) {
+                    result = new JSONTokener(jsonString).nextValue();
+                }
+                // Check if this is a String "my String value" and remove quote
+                // Other value type (numerical, boolean) should be without quote
+                else if (jsonString.startsWith("\"") && jsonString.endsWith("\"")) {
+                    result = jsonString.substring(1, jsonString.length() - 1);
+                }
             }
         }
         if (result == null) {
@@ -221,4 +274,13 @@ public class JsonHttpResponseHandler extends TextHttpResponseHandler {
         }
         return result;
     }
+
+    public boolean isUseRFC5179CompatibilityMode() {
+        return useRFC5179CompatibilityMode;
+    }
+
+    public void setUseRFC5179CompatibilityMode(boolean useRFC5179CompatibilityMode) {
+        this.useRFC5179CompatibilityMode = useRFC5179CompatibilityMode;
+    }
+
 }

@@ -1,3 +1,21 @@
+/*
+    Android Asynchronous Http Client
+    Copyright (c) 2011 James Smith <james@loopj.com>
+    http://loopj.com
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+*/
+
 package com.loopj.android.http;
 
 import android.content.Context;
@@ -11,10 +29,10 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 
-
 public abstract class FileAsyncHttpResponseHandler extends AsyncHttpResponseHandler {
 
     protected final File mFile;
+    protected final boolean append;
     private static final String LOG_TAG = "FileAsyncHttpResponseHandler";
 
     /**
@@ -23,9 +41,24 @@ public abstract class FileAsyncHttpResponseHandler extends AsyncHttpResponseHand
      * @param file File to store response within, must not be null
      */
     public FileAsyncHttpResponseHandler(File file) {
+        this(file, false);
+    }
+
+    /**
+     * Obtains new FileAsyncHttpResponseHandler and stores response in passed file
+     *
+     * @param file   File to store response within, must not be null
+     * @param append whether data should be appended to existing file
+     */
+    public FileAsyncHttpResponseHandler(File file, boolean append) {
         super();
-        assert (file != null);
+        Utils.asserts(file != null, "File passed into FileAsyncHttpResponseHandler constructor must not be null");
+        Utils.asserts(!file.isDirectory(), "File passed into FileAsyncHttpResponseHandler constructor must not point to directory");
+        if (!file.getParentFile().isDirectory()) {
+            Utils.asserts(file.getParentFile().mkdirs(), "Cannot create parent directories for requested File location");
+        }
         this.mFile = file;
+        this.append = append;
     }
 
     /**
@@ -36,6 +69,7 @@ public abstract class FileAsyncHttpResponseHandler extends AsyncHttpResponseHand
     public FileAsyncHttpResponseHandler(Context context) {
         super();
         this.mFile = getTemporaryFile(context);
+        this.append = false;
     }
 
     /**
@@ -54,11 +88,13 @@ public abstract class FileAsyncHttpResponseHandler extends AsyncHttpResponseHand
      * @return temporary file or null if creating file failed
      */
     protected File getTemporaryFile(Context context) {
-        assert (context != null);
+        Utils.asserts(context != null, "Tried creating temporary file without having Context");
         try {
+            // not effective in release mode
+            assert context != null;
             return File.createTempFile("temp_", "_handled", context.getCacheDir());
-        } catch (Throwable t) {
-            Log.e(LOG_TAG, "Cannot create temporary file", t);
+        } catch (IOException e) {
+            Log.e(LOG_TAG, "Cannot create temporary file", e);
         }
         return null;
     }
@@ -108,7 +144,7 @@ public abstract class FileAsyncHttpResponseHandler extends AsyncHttpResponseHand
         if (entity != null) {
             InputStream instream = entity.getContent();
             long contentLength = entity.getContentLength();
-            FileOutputStream buffer = new FileOutputStream(getTargetFile());
+            FileOutputStream buffer = new FileOutputStream(getTargetFile(), this.append);
             if (instream != null) {
                 try {
                     byte[] tmp = new byte[BUFFER_SIZE];
@@ -117,7 +153,7 @@ public abstract class FileAsyncHttpResponseHandler extends AsyncHttpResponseHand
                     while ((l = instream.read(tmp)) != -1 && !Thread.currentThread().isInterrupted()) {
                         count += l;
                         buffer.write(tmp, 0, l);
-                        sendProgressMessage(count, (int) contentLength);
+                        sendProgressMessage(count, contentLength);
                     }
                 } finally {
                     AsyncHttpClient.silentCloseInputStream(instream);
